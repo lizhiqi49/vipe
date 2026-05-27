@@ -119,7 +119,8 @@ class TrackAnythingProcessor(StreamProcessor):
         sam_run_gap: int = 30,
         mask_expand: int = 5,
     ) -> None:
-        self.mask_phrases = mask_phrases
+        # Defensive copy: prevent mutation of caller's list
+        self.mask_phrases = list(mask_phrases)
         self.sam_run_gap = sam_run_gap
         self.add_sky = add_sky
 
