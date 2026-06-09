@@ -68,6 +68,53 @@ def align_inv_depth_to_depth(
     return aligned_depth, scale, bias
 
 
+def align_inv_depth_scale_only_weighted(
+    source_inv_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+    quantile_masking: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Align inverse depth with the weighted scale-only fit used by SANA-WM Appendix B.1.
+
+    We solve `min_s sum_i w_i (s * source_inv_i - target_inv_i)^2` with
+    `w_i = target_inv_i = 1 / target_depth_i`, i.e. inverse-depth weighting and no bias term.
+    """
+    target_inv_depth = 1.0 / target_depth
+    source_mask = source_inv_depth > 0
+    target_depth_mask = target_depth > 0
+
+    if target_mask is None:
+        target_mask = target_depth_mask
+    else:
+        target_mask = torch.logical_and(target_mask > 0, target_depth_mask)
+
+    if quantile_masking:
+        outlier_quantiles = torch.tensor([0.1, 0.9], device=source_inv_depth.device)
+        source_data_low, source_data_high = torch.quantile(source_inv_depth[source_mask], outlier_quantiles)
+        target_data_low, target_data_high = torch.quantile(target_inv_depth[target_mask], outlier_quantiles)
+        source_mask = (source_inv_depth > source_data_low) & (source_inv_depth < source_data_high)
+        target_mask = (target_inv_depth > target_data_low) & (target_inv_depth < target_data_high)
+
+    mask = torch.logical_and(source_mask, target_mask)
+    if not torch.any(mask):
+        raise RuntimeError("No valid pixels remained after weighted inverse-depth masking")
+
+    source_data = source_inv_depth[mask].reshape(-1)
+    target_data = target_inv_depth[mask].reshape(-1)
+    weights = target_data
+
+    denom = torch.sum(weights * source_data.square())
+    if torch.abs(denom) < 1e-12:
+        raise RuntimeError("Weighted scale-only alignment became ill-conditioned")
+    scale = torch.sum(weights * source_data * target_data) / denom
+
+    aligned_inv_depth = source_inv_depth * scale
+    aligned_inv_depth = torch.clamp(aligned_inv_depth, min=1e-4)
+    aligned_depth = aligned_inv_depth.reciprocal()
+    return aligned_depth, scale
+
+
 def align_depth_to_depth(
     source_depth: torch.Tensor,
     target_depth: torch.Tensor,

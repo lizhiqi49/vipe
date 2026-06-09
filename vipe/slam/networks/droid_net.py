@@ -18,6 +18,7 @@
 # Licensed under the MIT License. See THIRD_PARTY_LICENSES.md for details.
 # -------------------------------------------------------------------------------------------------
 
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -558,16 +559,21 @@ class DroidNet(nn.Module):
 
     def load_weights(self):
         """load trained model weights"""
-        import gdown
+        override_path = os.environ.get("VIPE_DROID_MODEL_PATH")
+        if override_path:
+            ckpt_path = Path(override_path).expanduser()
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"VIPE_DROID_MODEL_PATH does not exist: {ckpt_path}")
+        else:
+            import gdown
 
-        # Download ckpt if needed.
-        ckpt_path = Path(torch.hub.get_dir()) / "droid_slam" / "droid.pth"
-        if not ckpt_path.exists():
+            ckpt_path = Path(torch.hub.get_dir()) / "droid_slam" / "droid.pth"
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            gdown.download(
-                id="1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh",
-                output=str(ckpt_path),
-            )
+            if not ckpt_path.exists():
+                gdown.download(
+                    id="1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh",
+                    output=str(ckpt_path),
+                )
 
         state_dict = OrderedDict(
             [(k.replace("module.", ""), v) for (k, v) in torch.load(ckpt_path, weights_only=True).items()]

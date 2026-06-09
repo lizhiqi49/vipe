@@ -13,34 +13,81 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 from .base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
 
 
-def make_depth_model(model: str):
+DepthModelFactory = Callable[[str], DepthEstimationModel]
+_DEPTH_MODEL_REGISTRY: dict[str, DepthModelFactory] = {}
+
+
+def register_depth_model(name: str) -> Callable[[DepthModelFactory], DepthModelFactory]:
+    def decorator(factory: DepthModelFactory) -> DepthModelFactory:
+        if name in _DEPTH_MODEL_REGISTRY:
+            raise ValueError(f"Depth model already registered: {name}")
+        _DEPTH_MODEL_REGISTRY[name] = factory
+        return factory
+
+    return decorator
+
+
+def parse_depth_model_name(model: str) -> tuple[str, str]:
     if "-" not in model:
-        model_name, model_sub = model, ""
-    else:
-        model_name, model_sub = model.split("-")
+        return model, ""
+    model_name, model_sub = model.split("-", 1)
+    return model_name, model_sub
 
-    if model_name == "metric3d":
-        from .metric3d import Metric3DDepthModel
 
-        return Metric3DDepthModel(version=2, model=model_sub)
+def make_depth_model(model: str) -> DepthEstimationModel:
+    model_name, model_sub = parse_depth_model_name(model)
+    try:
+        factory = _DEPTH_MODEL_REGISTRY[model_name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown depth model: {model}") from exc
+    return factory(model_sub)
 
-    elif model_name == "unidepth":
-        from .unidepth import UniDepth2Model
 
-        return UniDepth2Model(type=model_sub)
+@register_depth_model("metric3d")
+def _make_metric3d_depth_model(model_sub: str) -> DepthEstimationModel:
+    from .metric3d import Metric3DDepthModel
 
-    elif model_name == "moge":
-        from .moge import MogeModel
+    return Metric3DDepthModel(version=2, model=model_sub)
 
-        return MogeModel()
 
-    elif model_name == "dav3":
-        from .dav3 import DepthAnything3Model
+@register_depth_model("unidepth")
+def _make_unidepth_depth_model(model_sub: str) -> DepthEstimationModel:
+    from .unidepth import UniDepth2Model
 
-        return DepthAnything3Model()
+    return UniDepth2Model(type=model_sub)
 
-    else:
-        raise ValueError(f"Unknown depth model: {model}")
+
+@register_depth_model("moge")
+def _make_moge_depth_model(model_sub: str) -> DepthEstimationModel:
+    del model_sub
+    from .moge import MogeModel
+
+    return MogeModel()
+
+
+@register_depth_model("moge2")
+def _make_moge2_depth_model(model_sub: str) -> DepthEstimationModel:
+    del model_sub
+    from .moge2 import Moge2Model
+
+    return Moge2Model()
+
+
+@register_depth_model("dav3")
+def _make_dav3_depth_model(model_sub: str) -> DepthEstimationModel:
+    del model_sub
+    from .dav3 import DepthAnything3Model
+
+    return DepthAnything3Model()
+
+
+@register_depth_model("pi3x")
+def _make_pi3x_depth_model(model_sub: str) -> DepthEstimationModel:
+    from .pi3x import Pi3XDepthModel
+
+    return Pi3XDepthModel(model_sub=model_sub)

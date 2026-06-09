@@ -16,6 +16,7 @@
 
 import logging
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -39,10 +40,43 @@ from .processors import (
     AdaptiveDepthProcessor,
     GeoCalibIntrinsicsProcessor,
     MultiviewDepthProcessor,
+    SanaDepthProcessor,
     TrackAnythingProcessor,
 )
 
 logger = logging.getLogger(__name__)
+
+
+PostProcessorFactory = Callable[[SLAMOutput, int, str], StreamProcessor]
+_POST_PROCESSOR_FACTORIES: dict[str, PostProcessorFactory] = {}
+
+
+def register_post_processor_prefix(prefix: str) -> Callable[[PostProcessorFactory], PostProcessorFactory]:
+    def decorator(factory: PostProcessorFactory) -> PostProcessorFactory:
+        if prefix in _POST_PROCESSOR_FACTORIES:
+            raise ValueError(f"Post-processor prefix already registered: {prefix}")
+        _POST_PROCESSOR_FACTORIES[prefix] = factory
+        return factory
+
+    return decorator
+
+
+@register_post_processor_prefix("mvd_")
+def _make_multiview_depth_processor(slam_output: SLAMOutput, view_idx: int, model: str) -> StreamProcessor:
+    del view_idx
+    return MultiviewDepthProcessor(slam_output, model=model)
+
+
+@register_post_processor_prefix("sana_")
+def _make_sana_depth_processor(slam_output: SLAMOutput, view_idx: int, model: str) -> StreamProcessor:
+    return SanaDepthProcessor(slam_output, view_idx=view_idx, model=model)
+
+
+def make_post_depth_processor(slam_output: SLAMOutput, view_idx: int, model: str) -> StreamProcessor:
+    for prefix in sorted(_POST_PROCESSOR_FACTORIES, key=len, reverse=True):
+        if model.startswith(prefix):
+            return _POST_PROCESSOR_FACTORIES[prefix](slam_output, view_idx, model)
+    return AdaptiveDepthProcessor(slam_output, view_idx, model)
 
 
 class DefaultAnnotationPipeline(Pipeline):
@@ -92,10 +126,7 @@ class DefaultAnnotationPipeline(Pipeline):
             )
         ]
         if (depth_align_model := self.post_cfg.depth_align_model) is not None:
-            if depth_align_model.startswith("mvd_"):
-                post_processors.append(MultiviewDepthProcessor(slam_output, model=depth_align_model))
-            else:
-                post_processors.append(AdaptiveDepthProcessor(slam_output, view_idx, depth_align_model))
+            post_processors.append(make_post_depth_processor(slam_output, view_idx, depth_align_model))
         return ProcessedVideoStream(video_stream, post_processors)
 
     def run(self, video_data: VideoStream | MultiviewVideoList) -> AnnotationPipelineOutput:

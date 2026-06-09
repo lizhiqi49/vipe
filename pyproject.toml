@@ -117,6 +117,14 @@ Homepage = "https://research.nvidia.com/labs/toronto-ai/vipe"
 Repository = "https://github.com/nv-tlabs/vipe"
 Paper = "https://research.nvidia.com/labs/toronto-ai/vipe/assets/paper.pdf"
 
+[project.optional-dependencies]
+moge2 = [
+    "moge @ git+https://github.com/microsoft/MoGe.git",
+]
+pi3x = [
+    "pi3 @ git+https://github.com/yyfz/Pi3.git",
+]
+
 [dependency-groups]
 dev = [
     "build>=1,<2",

@@ -23,7 +23,7 @@ from scipy.spatial.transform import Rotation as R
 
 from vipe.ext.lietorch import SE3, SO3
 from vipe.priors.depth import DepthEstimationInput, make_depth_model
-from vipe.priors.depth.alignment import align_inv_depth_to_depth
+from vipe.priors.depth.alignment import align_inv_depth_scale_only_weighted, align_inv_depth_to_depth
 from vipe.priors.depth.priorda import PriorDAModel
 from vipe.priors.depth.videodepthanything import VideoDepthAnythingDepthModel
 from vipe.priors.geocalib import GeoCalib
@@ -328,6 +328,123 @@ class AdaptiveDepthProcessor(StreamProcessor):
             else:
                 frame.metric_depth = prompt_result
 
+            yield frame
+
+
+class SanaDepthProcessor(StreamProcessor):
+    """
+    SANA-WM-style depth fusion using Pi3X for relative inverse depth and MoGe-2 as the
+    per-frame metric anchor.
+    """
+
+    def __init__(
+        self,
+        slam_output: SLAMOutput,
+        view_idx: int = 0,
+        model: str = "sana_pi3x_moge2",
+    ):
+        super().__init__()
+        del slam_output
+        assert view_idx == 0, "SanaDepthProcessor currently supports view_idx=0 only"
+        self.require_cache = True
+        self.model = model
+
+        recipe = model.removeprefix("sana_")
+        if recipe not in {"pi3x_moge2", "pi3x_moge2_affine"}:
+            raise ValueError(f"Unknown SANA depth recipe: {model}")
+
+        self.metric_depth_model = make_depth_model("moge2")
+        self.video_depth_model = make_depth_model("pi3x")
+        self.use_affine_alignment = recipe.endswith("_affine")
+        self.update_momentum = 0.99
+
+    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
+        raise NotImplementedError("SanaDepthProcessor should not be called directly.")
+
+    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
+        return previous_attributes | {FrameAttribute.METRIC_DEPTH}
+
+    def _compute_video_pi3x(self, frame_iterator: Iterator[VideoFrame]) -> tuple[torch.Tensor, list[VideoFrame]]:
+        frame_list: list[np.ndarray] = []
+        frame_data_list: list[VideoFrame] = []
+        for frame in frame_iterator:
+            frame_cpu = frame.cpu()
+            frame_data_list.append(frame_cpu)
+            frame_list.append(frame_cpu.rgb.cpu().numpy())
+
+        video_depth_result = self.video_depth_model.estimate(
+            DepthEstimationInput(video_frame_list=frame_list)
+        ).relative_inv_depth
+        return unpack_optional(video_depth_result), frame_data_list
+
+    def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
+        del pass_idx
+        self.cache_scale: torch.Tensor | None = None
+        self.cache_bias: torch.Tensor | None = None
+        video_depth_result, data_iterator = self._compute_video_pi3x(previous_iterator)
+
+        for frame_idx, frame in pbar(enumerate(data_iterator), desc="Aligning SANA depth"):
+            frame = frame.cuda()
+            metric_anchor = unpack_optional(
+                self.metric_depth_model.estimate(
+                    DepthEstimationInput(
+                        rgb=frame.rgb.float().cuda(),
+                        intrinsics=frame.intrinsics,
+                        camera_type=frame.camera_type,
+                    )
+                ).metric_depth
+            )
+            video_depth_inv = video_depth_result[frame_idx].to(metric_anchor.device)
+
+            align_mask = video_depth_inv > 1e-3
+            if frame.mask is not None:
+                align_mask = align_mask & frame.mask & (~frame.sky_mask)
+
+            try:
+                if self.use_affine_alignment:
+                    _, scale_tensor, bias_tensor = align_inv_depth_to_depth(
+                        video_depth_inv,
+                        metric_anchor,
+                        align_mask,
+                    )
+                    aligned_inv_depth = video_depth_inv * scale_tensor + bias_tensor
+                    scale_candidate = scale_tensor
+                else:
+                    _, scale_tensor = align_inv_depth_scale_only_weighted(
+                        video_depth_inv,
+                        metric_anchor,
+                        align_mask,
+                    )
+                    aligned_inv_depth = video_depth_inv * scale_tensor
+                    scale_candidate = scale_tensor
+            except RuntimeError:
+                if self.cache_scale is None or (self.use_affine_alignment and self.cache_bias is None):
+                    raise
+                scale_candidate = self.cache_scale
+                if self.use_affine_alignment:
+                    bias_tensor = self.cache_bias
+                    aligned_inv_depth = video_depth_inv * scale_candidate + bias_tensor
+                else:
+                    aligned_inv_depth = video_depth_inv * scale_candidate
+
+            if self.cache_scale is None:
+                self.cache_scale = scale_candidate
+                if self.use_affine_alignment:
+                    self.cache_bias = bias_tensor
+            scale_tensor = self.cache_scale * self.update_momentum + scale_candidate * (1 - self.update_momentum)
+            self.cache_scale = scale_tensor
+
+            if self.use_affine_alignment:
+                assert self.cache_bias is not None
+                self.cache_bias = self.cache_bias * self.update_momentum + bias_tensor * (1 - self.update_momentum)
+                bias_tensor = self.cache_bias
+                aligned_inv_depth = video_depth_inv * scale_tensor + bias_tensor
+            else:
+                aligned_inv_depth = video_depth_inv * scale_tensor
+
+            aligned_inv_depth = torch.clamp(aligned_inv_depth, min=1e-3)
+            frame.metric_depth = aligned_inv_depth.reciprocal()
+            frame.information = "sana(moge2+pi3x,affine)" if self.use_affine_alignment else "sana(moge2+pi3x)"
             yield frame
 
 

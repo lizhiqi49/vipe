@@ -1,0 +1,8 @@
+defaults:
+  - default
+
+slam:
+  keyframe_depth: moge2
+
+post:
+  depth_align_model: "sana_pi3x_moge2"
