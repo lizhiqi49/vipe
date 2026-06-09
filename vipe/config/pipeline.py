@@ -10,7 +10,7 @@ from pydantic import model_validator
 from vipe.config.base_schema import BaseConfigSchema, Field
 from vipe.config.slam import SLAMConfig
 
-FrameAttributeName = Literal["rgb", "instance", "depth", "pcd", "metric_pcd", "rectified"]
+FrameAttributeName = Literal["rgb", "instance", "depth", "pcd", "shaded_depth", "rectified"]
 
 
 class InstanceInitConfig(BaseConfigSchema):

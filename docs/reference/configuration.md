@@ -151,7 +151,7 @@ Output paths and artifact/visualization controls.
 | `save_slam_map` | bool | `false` | - | Save the sparse SLAM reconstruction map for lightweight COLMAP conversion. |
 | `save_viz` | bool | required | - | Render MP4 visualization videos for the configured visualization attributes. |
 | `viz_downsample` | int | required | >= 1 | Downsample factor applied when rendering visualization videos. |
-| `viz_attributes` | list[list[`rgb` \| `instance` \| `depth` \| `pcd` \| `rectified`]] | required | min items 1 | Groups of frame attributes to render into visualization videos. Each inner list becomes one panel. |
+| `viz_attributes` | list[list[`rgb` \| `instance` \| `depth` \| `pcd` \| `shaded_depth` \| `rectified`]] | required | min items 1 | Groups of frame attributes to render into visualization videos. Each inner list becomes one panel. |
 
 ### DefaultPipelineConfig
 
