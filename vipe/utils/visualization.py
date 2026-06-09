@@ -472,7 +472,7 @@ def save_projection_video(
                 img_x,
                 img_y,
             )
-            xyz_local = pts_h[..., :3] / pts_h[..., 3:].clamp(min=1e-3)[..., None]
+            xyz_local = pts_h[..., :3] / pts_h[..., 3:].clamp(min=1e-3)
             if xyz_local.dim() == 4 and xyz_local.shape[0] == 1:
                 xyz_local = xyz_local[0]
             valid_mask &= torch.isfinite(xyz_local).all(dim=-1)
