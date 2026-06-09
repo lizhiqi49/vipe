@@ -6,3 +6,6 @@ slam:
 
 post:
   depth_align_model: "sana_pi3x_moge2_affine"
+
+output:
+  viz_attributes: [['rgb', 'metric_pcd'], ['depth', 'pcd']]

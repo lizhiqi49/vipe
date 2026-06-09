@@ -259,6 +259,66 @@ def project_points(
     return draw_points_batch(canvas, uv_np, color, stencil=POINTS_STENCIL)
 
 
+def render_metric_point_cloud(
+    local_xyz: np.ndarray,
+    color: np.ndarray | None,
+    frame_size: tuple[int, int],
+) -> np.ndarray:
+    canvas = np.ones((frame_size[0], frame_size[1], 3), dtype=np.uint8) * 255
+    if local_xyz.shape[0] == 0:
+        return canvas
+
+    center = np.median(local_xyz, axis=0)
+    radius = np.linalg.norm(local_xyz - center[None], axis=1)
+    orbit_radius = max(float(np.quantile(radius, 0.9)), 1e-2)
+
+    eye = center + np.array([-0.35 * orbit_radius, -0.20 * orbit_radius, -1.10 * orbit_radius], dtype=np.float32)
+    target = center
+    up_hint = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+
+    forward = target - eye
+    forward_norm = np.linalg.norm(forward)
+    if forward_norm < 1e-6:
+        forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        forward_norm = 1.0
+    forward /= forward_norm
+
+    right = np.cross(forward, up_hint)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-6:
+        up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        right = np.cross(forward, up_hint)
+        right_norm = max(np.linalg.norm(right), 1e-6)
+    right /= right_norm
+    up = np.cross(right, forward)
+
+    local_view = local_xyz - eye[None]
+    view_x = local_view @ right
+    view_y = local_view @ up
+    view_z = local_view @ forward
+
+    valid = np.isfinite(view_z) & (view_z > 1e-3)
+    if not np.any(valid):
+        return canvas
+
+    view_x = view_x[valid]
+    view_y = view_y[valid]
+    view_z = view_z[valid]
+    if color is not None:
+        color = color[valid]
+        if np.issubdtype(color.dtype, np.floating):
+            color = (color * 255).astype(np.uint8)
+
+    img_h, img_w = frame_size
+    focal = min(img_h, img_w) * 0.95
+    u = focal * (view_x / view_z) + img_w / 2
+    v = focal * (view_y / view_z) + img_h / 2
+    uv = np.stack([u, v], axis=-1)
+
+    order = np.argsort(view_z)[::-1]
+    return draw_points_batch(canvas, uv[order], None if color is None else color[order], stencil=POINTS_STENCIL)
+
+
 def image_above_text(img: np.ndarray, text: str = "<TEXT>") -> Image.Image:
     if img.dtype == np.float32 or img.dtype == np.float64:
         img = (img * 255).astype(np.uint8)
@@ -380,6 +440,50 @@ def save_projection_video(
                 )
             yield cv2.addWeighted(rgb_img, 0.2, pcd_img, 0.8, 0)
 
+    def get_metric_pcd_imgs():
+        for frame_data in video_stream:
+            assert isinstance(frame_data, VideoFrame)
+            if frame_data.metric_depth is None or frame_data.intrinsics is None or frame_data.camera_type is None:
+                yield na_img
+                continue
+
+            depth_data = frame_data.metric_depth.clone()
+            depth_data = depth_data[::subsample_factor, ::subsample_factor]
+            rgb_data = frame_data.rgb[::subsample_factor, ::subsample_factor].cpu().numpy()
+
+            valid_mask = torch.isfinite(depth_data) & (depth_data > 1e-3)
+            if frame_data.mask is not None:
+                valid_mask &= frame_data.mask[::subsample_factor, ::subsample_factor]
+            sky_mask = frame_data.sky_mask[::subsample_factor, ::subsample_factor]
+            valid_mask &= ~sky_mask
+
+            img_y, img_x = torch.meshgrid(
+                torch.arange(depth_data.shape[0], device=depth_data.device, dtype=torch.float32),
+                torch.arange(depth_data.shape[1], device=depth_data.device, dtype=torch.float32),
+                indexing="ij",
+            )
+            if frame_data.camera_type == CameraType.PANORAMA:
+                img_x = (img_x + 0.5) / depth_data.shape[1]
+                img_y = (img_y + 0.5) / depth_data.shape[0]
+
+            camera_model = frame_data.camera_type.build_camera_model(frame_data.intrinsics).scaled(1.0 / subsample_factor)
+            pts_h, _, _ = camera_model.iproj_disp(
+                depth_data.clamp(min=1e-3).reciprocal(),
+                img_x,
+                img_y,
+            )
+            xyz_local = pts_h[..., :3] / pts_h[..., 3:].clamp(min=1e-3)[..., None]
+            valid_mask &= torch.isfinite(xyz_local).all(dim=-1)
+
+            xyz_local_np = xyz_local[valid_mask].cpu().numpy()
+            rgb_np = rgb_data[valid_mask.cpu().numpy()]
+            metric_pcd_img = render_metric_point_cloud(
+                xyz_local_np,
+                rgb_np,
+                frame_size=(img_h, img_w),
+            )
+            yield metric_pcd_img
+
     def get_rectified_imgs():
         # Obtain rectification map
         for frame_data in video_stream:
@@ -456,6 +560,7 @@ def save_projection_video(
                 "rgb": get_rgb_imgs(),
                 "depth": get_depth_imgs(),
                 "pcd": get_pcd_imgs(),
+                "metric_pcd": get_metric_pcd_imgs(),
                 "instance": get_instance_imgs(),
                 "rectified": get_rectified_imgs(),
                 "empty": get_empty_imgs(),
