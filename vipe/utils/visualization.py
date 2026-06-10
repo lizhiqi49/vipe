@@ -270,22 +270,43 @@ def render_shaded_depth(depth: np.ndarray, valid_mask: np.ndarray) -> np.ndarray
 
     log_depth = np.log(np.clip(depth_filled, a_min=1e-3, a_max=None))
     grad_y, grad_x = np.gradient(log_depth)
+    valid_log_depth = log_depth[valid_mask]
+    depth_low, depth_high = np.quantile(valid_log_depth, [0.02, 0.98])
+    depth_scale = max(depth_high - depth_low, 1e-6)
+    inverse_depth = 1.0 - np.clip((log_depth - depth_low) / depth_scale, 0.0, 1.0)
+
     normals = np.stack(
         [
             -grad_x,
             -grad_y,
-            np.full_like(log_depth, 0.75),
+            np.full_like(log_depth, 0.35),
         ],
         axis=-1,
     )
     normals /= np.linalg.norm(normals, axis=-1, keepdims=True).clip(min=1e-6)
 
-    light_dir = np.array([-0.35, 0.25, 0.90], dtype=np.float32)
-    light_dir /= np.linalg.norm(light_dir)
-    shading = (normals * light_dir[None, None, :]).sum(axis=-1)
-    shading = np.clip(0.20 + 0.80 * shading, 0.0, 1.0)
+    key_light = np.array([-0.45, 0.35, 0.82], dtype=np.float32)
+    key_light /= np.linalg.norm(key_light)
+    fill_light = np.array([0.35, -0.10, 0.55], dtype=np.float32)
+    fill_light /= np.linalg.norm(fill_light)
 
-    shaded = (shading[..., None] * 255).astype(np.uint8)
+    key_shading = np.clip((normals * key_light[None, None, :]).sum(axis=-1), 0.0, 1.0)
+    fill_shading = np.clip((normals * fill_light[None, None, :]).sum(axis=-1), 0.0, 1.0)
+
+    grad_mag = np.hypot(grad_x, grad_y)
+    edge_scale = max(np.quantile(grad_mag[valid_mask], 0.95), 1e-6)
+    edge_strength = np.clip(grad_mag / edge_scale, 0.0, 1.0) ** 0.8
+
+    intensity = (
+        0.10
+        + 0.52 * (inverse_depth**0.9)
+        + 0.20 * (key_shading**0.9)
+        + 0.08 * fill_shading
+        + 0.30 * edge_strength
+    )
+    intensity = np.clip(intensity, 0.0, 1.0)
+
+    shaded = (intensity[..., None] * 255).astype(np.uint8)
     canvas[valid_mask] = shaded[valid_mask]
     return canvas
 
