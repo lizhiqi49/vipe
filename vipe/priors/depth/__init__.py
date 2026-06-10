@@ -91,3 +91,10 @@ def _make_pi3x_depth_model(model_sub: str) -> DepthEstimationModel:
     from .pi3x import Pi3XDepthModel
 
     return Pi3XDepthModel(model_sub=model_sub)
+
+
+@register_depth_model("vggt_omega")
+def _make_vggt_omega_depth_model(model_sub: str) -> DepthEstimationModel:
+    from .vggt_omega import VGGTOmegaDepthModel
+
+    return VGGTOmegaDepthModel(model_sub=model_sub)

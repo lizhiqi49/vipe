@@ -124,6 +124,9 @@ moge2 = [
 pi3x = [
     "pi3 @ git+https://github.com/yyfz/Pi3.git",
 ]
+vggt = [
+    "vggt-omega @ git+https://github.com/facebookresearch/vggt-omega.git",
+]
 
 [dependency-groups]
 dev = [

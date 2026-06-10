@@ -1,0 +1,11 @@
+defaults:
+  - default
+
+slam:
+  keyframe_depth: moge2
+
+post:
+  depth_align_model: "sana_vggt_moge2"
+
+output:
+  viz_attributes: [['rgb', 'shaded_depth'], ['depth', 'pcd']]

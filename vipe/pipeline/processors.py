@@ -333,8 +333,8 @@ class AdaptiveDepthProcessor(StreamProcessor):
 
 class SanaDepthProcessor(StreamProcessor):
     """
-    SANA-WM-style depth fusion using Pi3X for relative inverse depth and MoGe-2 as the
-    per-frame metric anchor.
+    SANA-WM-style depth fusion using a multi-frame video-depth model (Pi3X or
+    VGGT-Omega) for relative inverse depth and MoGe-2 as the per-frame metric anchor.
     """
 
     def __init__(
@@ -350,12 +350,20 @@ class SanaDepthProcessor(StreamProcessor):
         self.model = model
 
         recipe = model.removeprefix("sana_")
-        if recipe not in {"pi3x_moge2", "pi3x_moge2_affine"}:
+        recipe_config = {
+            "pi3x_moge2": ("pi3x", "pi3x", False),
+            "pi3x_moge2_affine": ("pi3x", "pi3x", True),
+            "vggt_moge2": ("vggt_omega", "vggt", False),
+            "vggt_moge2_affine": ("vggt_omega", "vggt", True),
+        }.get(recipe)
+        if recipe_config is None:
             raise ValueError(f"Unknown SANA depth recipe: {model}")
 
+        video_depth_model_name, video_model_label, use_affine_alignment = recipe_config
         self.metric_depth_model = make_depth_model("moge2")
-        self.video_depth_model = make_depth_model("pi3x")
-        self.use_affine_alignment = recipe.endswith("_affine")
+        self.video_depth_model = make_depth_model(video_depth_model_name)
+        self.video_model_label = video_model_label
+        self.use_affine_alignment = use_affine_alignment
         self.update_momentum = 0.99
 
     def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
@@ -364,7 +372,7 @@ class SanaDepthProcessor(StreamProcessor):
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.METRIC_DEPTH}
 
-    def _compute_video_pi3x(self, frame_iterator: Iterator[VideoFrame]) -> tuple[torch.Tensor, list[VideoFrame]]:
+    def _compute_video_depth(self, frame_iterator: Iterator[VideoFrame]) -> tuple[torch.Tensor, list[VideoFrame]]:
         frame_list: list[np.ndarray] = []
         frame_data_list: list[VideoFrame] = []
         for frame in frame_iterator:
@@ -381,7 +389,7 @@ class SanaDepthProcessor(StreamProcessor):
         del pass_idx
         self.cache_scale: torch.Tensor | None = None
         self.cache_bias: torch.Tensor | None = None
-        video_depth_result, data_iterator = self._compute_video_pi3x(previous_iterator)
+        video_depth_result, data_iterator = self._compute_video_depth(previous_iterator)
 
         for frame_idx, frame in pbar(enumerate(data_iterator), desc="Aligning SANA depth"):
             frame = frame.cuda()
@@ -444,7 +452,11 @@ class SanaDepthProcessor(StreamProcessor):
 
             aligned_inv_depth = torch.clamp(aligned_inv_depth, min=1e-3)
             frame.metric_depth = aligned_inv_depth.reciprocal()
-            frame.information = "sana(moge2+pi3x,affine)" if self.use_affine_alignment else "sana(moge2+pi3x)"
+            frame.information = (
+                f"sana(moge2+{self.video_model_label},affine)"
+                if self.use_affine_alignment
+                else f"sana(moge2+{self.video_model_label})"
+            )
             yield frame
 
 
