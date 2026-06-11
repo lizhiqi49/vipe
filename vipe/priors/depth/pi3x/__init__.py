@@ -18,6 +18,13 @@ except ModuleNotFoundError:
 from vipe.utils.misc import unpack_optional
 
 from ..base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
+from ..windowed import WindowedDepthAccumulator, window_starts
+
+
+# Official Pi3 preprocessing pixel budget (pi3.utils.basic.load_images_as_tensor). Resolution
+# is locked to this contract: feeding the model anything other than the official patch-aligned
+# resolution is unsupported (issue #23). Memory is bounded only by the temporal window.
+_PI3X_PIXEL_LIMIT = 255000
 
 
 class Pi3XDepthModel(DepthEstimationModel):
@@ -39,7 +46,7 @@ class Pi3XDepthModel(DepthEstimationModel):
         self.model = Pi3X.from_pretrained(pretrained, local_files_only=Path(pretrained).exists())
         self.model = self.model.cuda().eval()
         self.patch_size = _resolve_pi3x_patch_size(self.model)
-        self.pixel_limit = max(int(os.environ.get("VIPE_PI3X_PIXEL_LIMIT", "255000")), self.patch_size**2)
+        self.pixel_limit = max(_PI3X_PIXEL_LIMIT, self.patch_size**2)
         self.window_size = max(int(os.environ.get("VIPE_PI3X_WINDOW_SIZE", "64")), 1)
         self.window_overlap = max(int(os.environ.get("VIPE_PI3X_WINDOW_OVERLAP", "8")), 0)
         self.autocast_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -54,11 +61,9 @@ class Pi3XDepthModel(DepthEstimationModel):
             raise ValueError("Pi3XDepthModel requires a non-empty video_frame_list")
 
         total_frames = len(frame_list)
-        depth_sum: torch.Tensor | None = None
-        conf_sum: torch.Tensor | None = None
-        depth_count: torch.Tensor | None = None
+        accumulator = WindowedDepthAccumulator(total_frames)
 
-        for start in self._window_starts(total_frames):
+        for start in window_starts(total_frames, self.window_size, self.window_overlap):
             end = min(start + self.window_size, total_frames)
             window_frames = frame_list[start:end]
             inputs, original_size = self._frames_to_tensor(window_frames)
@@ -79,27 +84,11 @@ class Pi3XDepthModel(DepthEstimationModel):
                 confidence = torch.ones_like(relative_inv_depth)
             else:
                 confidence = torch.sigmoid(conf.squeeze(-1) if conf.dim() == 4 else conf)
-            relative_inv_depth = self._restore_map_size(relative_inv_depth, original_size).to(device="cpu", dtype=torch.float32)
-            confidence = self._restore_map_size(confidence, original_size).to(device="cpu", dtype=torch.float32)
+            relative_inv_depth = self._restore_map_size(relative_inv_depth, original_size)
+            confidence = self._restore_map_size(confidence, original_size)
+            accumulator.add(start, end, relative_inv_depth, confidence)
 
-            if depth_sum is None:
-                depth_shape = (total_frames,) + tuple(relative_inv_depth.shape[1:])
-                depth_sum = torch.zeros(depth_shape, device="cpu", dtype=relative_inv_depth.dtype)
-                conf_sum = torch.zeros_like(depth_sum)
-                depth_count = torch.zeros_like(depth_sum)
-
-            assert depth_sum is not None
-            assert conf_sum is not None
-            assert depth_count is not None
-            depth_sum[start:end] += relative_inv_depth
-            conf_sum[start:end] += confidence
-            depth_count[start:end] += 1
-
-        assert depth_sum is not None
-        assert conf_sum is not None
-        assert depth_count is not None
-        relative_inv_depth = depth_sum / torch.clamp(depth_count, min=1)
-        confidence = conf_sum / torch.clamp(depth_count, min=1)
+        relative_inv_depth, confidence = accumulator.result()
         return DepthEstimationResult(relative_inv_depth=relative_inv_depth, confidence=confidence)
 
     def _frames_to_tensor(self, frame_list: list[np.ndarray]) -> tuple[torch.Tensor, tuple[int, int]]:
@@ -112,15 +101,6 @@ class Pi3XDepthModel(DepthEstimationModel):
         if target_size != original_size:
             frames = F.interpolate(frames, size=target_size, mode="bilinear", align_corners=False)
         return frames.unsqueeze(0), original_size
-
-    def _window_starts(self, total_frames: int) -> list[int]:
-        if total_frames <= self.window_size:
-            return [0]
-        step = max(self.window_size - self.window_overlap, 1)
-        starts = list(range(0, total_frames - self.window_size + 1, step))
-        if starts[-1] != total_frames - self.window_size:
-            starts.append(total_frames - self.window_size)
-        return starts
 
     def _aligned_image_size(self, height: int, width: int) -> tuple[int, int]:
         patch = max(int(self.patch_size), 1)

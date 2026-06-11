@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 
@@ -21,6 +20,7 @@ except ModuleNotFoundError:
 from vipe.utils.misc import unpack_optional
 
 from ..base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
+from ..windowed import WindowedDepthAccumulator, window_starts
 
 
 _VGGT_OMEGA_REPO_ID = "facebook/VGGT-Omega"
@@ -51,12 +51,21 @@ class VGGTOmegaDepthModel(DepthEstimationModel):
         self.model = VGGTOmega().cuda().eval()
         self.model.load_state_dict(state_dict)
 
+        # Resolution is locked to the official load_fn contract: balanced/max_size over a
+        # patch-aligned image_resolution. There is no pixel_limit knob — the official
+        # preprocessing has no such concept, and resizing outside this contract would feed
+        # the model an unsupported resolution (issue #23). Memory is bounded only by the
+        # temporal window below, never by shrinking resolution.
         self.patch_size = 16
-        self.image_resolution = 512
-        self.pixel_limit = max(
-            int(os.environ.get("VIPE_VGGT_OMEGA_PIXEL_LIMIT", str(self.image_resolution**2))),
-            self.patch_size**2,
-        )
+        self.image_resolution = max(int(os.environ.get("VIPE_VGGT_OMEGA_IMAGE_RESOLUTION", "512")), self.patch_size)
+        if self.image_resolution % self.patch_size != 0:
+            raise ValueError(
+                f"VIPE_VGGT_OMEGA_IMAGE_RESOLUTION must be a multiple of patch size {self.patch_size}, "
+                f"got {self.image_resolution}"
+            )
+        self.mode = os.environ.get("VIPE_VGGT_OMEGA_MODE", "balanced")
+        if self.mode not in ("balanced", "max_size"):
+            raise ValueError(f"VIPE_VGGT_OMEGA_MODE must be 'balanced' or 'max_size', got {self.mode!r}")
         self.window_size = max(int(os.environ.get("VIPE_VGGT_OMEGA_WINDOW_SIZE", "64")), 1)
         self.window_overlap = max(int(os.environ.get("VIPE_VGGT_OMEGA_WINDOW_OVERLAP", "8")), 0)
         self.autocast_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -71,11 +80,9 @@ class VGGTOmegaDepthModel(DepthEstimationModel):
             raise ValueError("VGGTOmegaDepthModel requires a non-empty video_frame_list")
 
         total_frames = len(frame_list)
-        depth_sum: torch.Tensor | None = None
-        conf_sum: torch.Tensor | None = None
-        depth_count: torch.Tensor | None = None
+        accumulator = WindowedDepthAccumulator(total_frames)
 
-        for start in self._window_starts(total_frames):
+        for start in window_starts(total_frames, self.window_size, self.window_overlap):
             end = min(start + self.window_size, total_frames)
             window_frames = frame_list[start:end]
             inputs, restore_spec = self._frames_to_tensor(window_frames)
@@ -94,30 +101,11 @@ class VGGTOmegaDepthModel(DepthEstimationModel):
             relative_inv_depth = video_depth.reciprocal()
             confidence = torch.ones_like(relative_inv_depth) if conf is None else conf
 
-            relative_inv_depth = self._restore_map_size(relative_inv_depth, restore_spec).to(
-                device="cpu",
-                dtype=torch.float32,
-            )
-            confidence = self._restore_map_size(confidence, restore_spec).to(device="cpu", dtype=torch.float32)
+            relative_inv_depth = self._restore_map_size(relative_inv_depth, restore_spec)
+            confidence = self._restore_map_size(confidence, restore_spec)
+            accumulator.add(start, end, relative_inv_depth, confidence)
 
-            if depth_sum is None:
-                depth_shape = (total_frames,) + tuple(relative_inv_depth.shape[1:])
-                depth_sum = torch.zeros(depth_shape, device="cpu", dtype=relative_inv_depth.dtype)
-                conf_sum = torch.zeros_like(depth_sum)
-                depth_count = torch.zeros_like(depth_sum)
-
-            assert depth_sum is not None
-            assert conf_sum is not None
-            assert depth_count is not None
-            depth_sum[start:end] += relative_inv_depth
-            conf_sum[start:end] += confidence
-            depth_count[start:end] += 1
-
-        assert depth_sum is not None
-        assert conf_sum is not None
-        assert depth_count is not None
-        relative_inv_depth = depth_sum / torch.clamp(depth_count, min=1)
-        confidence = conf_sum / torch.clamp(depth_count, min=1)
+        relative_inv_depth, confidence = accumulator.result()
         return DepthEstimationResult(relative_inv_depth=relative_inv_depth, confidence=confidence)
 
     def _frames_to_tensor(self, frame_list: list[np.ndarray]) -> tuple[torch.Tensor, dict[str, tuple[int, int] | tuple[int, int, int, int]]]:
@@ -128,12 +116,13 @@ class VGGTOmegaDepthModel(DepthEstimationModel):
             image = _frame_to_pil(frame)
             original_size = (image.height, image.width)
             cropped_image, crop_box = _crop_to_supported_aspect_ratio(image)
-            target_size = _balanced_target_shape(
-                aspect_ratio=cropped_image.height / max(cropped_image.width, 1),
-                image_resolution=self.image_resolution,
-                patch_size=self.patch_size,
-            )
-            target_size = _fit_target_size_to_pixel_limit(target_size, self.pixel_limit, self.patch_size)
+            aspect_ratio = cropped_image.height / max(cropped_image.width, 1)
+            if self.mode == "balanced":
+                target_size = _balanced_target_shape(aspect_ratio, self.image_resolution, self.patch_size)
+            else:
+                target_size = _max_size_target_shape(aspect_ratio, self.image_resolution, self.patch_size)
+            if target_size[0] % self.patch_size != 0 or target_size[1] % self.patch_size != 0:
+                raise ValueError(f"VGGT-Omega target size {target_size} is not patch-aligned ({self.patch_size})")
             resized_image = cropped_image.resize((target_size[1], target_size[0]), Image.Resampling.BICUBIC)
             tensor = torch.from_numpy(np.array(resized_image, copy=True)).float() / 255.0
             tensors.append(tensor.permute(2, 0, 1))
@@ -182,15 +171,6 @@ class VGGTOmegaDepthModel(DepthEstimationModel):
             (left, original_width - right, top, original_height - bottom),
             mode="replicate",
         ).squeeze(1)
-
-    def _window_starts(self, total_frames: int) -> list[int]:
-        if total_frames <= self.window_size:
-            return [0]
-        step = max(self.window_size - self.window_overlap, 1)
-        starts = list(range(0, total_frames - self.window_size + 1, step))
-        if starts[-1] != total_frames - self.window_size:
-            starts.append(total_frames - self.window_size)
-        return starts
 
 
 def _resolve_vggt_omega_checkpoint() -> str:
@@ -252,28 +232,16 @@ def _balanced_target_shape(aspect_ratio: float, image_resolution: int, patch_siz
     return height_patches * patch_size, width_patches * patch_size
 
 
-def _fit_target_size_to_pixel_limit(
-    target_size: tuple[int, int],
-    pixel_limit: int,
-    patch_size: int,
-) -> tuple[int, int]:
-    target_height, target_width = target_size
-    if target_height * target_width <= pixel_limit:
-        return target_height, target_width
-
-    scale = math.sqrt(pixel_limit / float(target_height * target_width))
-    target_height = _round_to_patch_multiple(target_height * scale, patch_size)
-    target_width = _round_to_patch_multiple(target_width * scale, patch_size)
-
-    while target_height * target_width > pixel_limit:
-        if target_height >= target_width and target_height > patch_size:
-            target_height -= patch_size
-        elif target_width > patch_size:
-            target_width -= patch_size
-        else:
-            break
-
-    return max(target_height, patch_size), max(target_width, patch_size)
+def _max_size_target_shape(aspect_ratio: float, image_resolution: int, patch_size: int) -> tuple[int, int]:
+    # Official load_fn `max_size` mode: longest side becomes image_resolution, shorter side
+    # is scaled to keep aspect ratio and rounded to a patch multiple.
+    if aspect_ratio >= 1.0:
+        height = image_resolution
+        width = _round_to_patch_multiple(image_resolution / aspect_ratio, patch_size)
+    else:
+        width = image_resolution
+        height = _round_to_patch_multiple(image_resolution * aspect_ratio, patch_size)
+    return height, width
 
 
 def _round_to_patch_multiple(value: float, patch_size: int) -> int:
