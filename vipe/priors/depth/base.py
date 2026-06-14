@@ -53,11 +53,16 @@ class DepthEstimationResult:
         One has to estimate scale and offset of such estimation
     - metric_depth: The estimated depth map ([B,], H, W) in metric scale.
     - confidence: The confidence map ([B,], H, W).
+    - camera_poses: Optional per-frame camera-to-world matrices (T, 4, 4) estimated jointly with
+        depth (e.g. Pi3XVO). Populated only by backends that recover pose; downstream may use these
+        to initialize or assist SLAM. The matrices carry the cross-chunk Sim3 (scale lives in the
+        3x3 block), so consumers must re-orthonormalize before treating them as rigid SE(3).
     """
 
     relative_inv_depth: torch.Tensor | None = None
     metric_depth: torch.Tensor | None = None
     confidence: torch.Tensor | None = None
+    camera_poses: torch.Tensor | None = None
 
 
 @dataclass(slots=True, kw_only=True)
