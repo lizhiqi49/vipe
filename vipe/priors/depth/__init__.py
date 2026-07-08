@@ -37,6 +37,11 @@ def make_depth_model(model: str):
 
         return MogeModel()
 
+    elif model_name == "pi3x_moge2":
+        from .pi3x_moge2 import Pi3XMoge2DepthModel
+
+        return Pi3XMoge2DepthModel()
+
     elif model_name == "dav3":
         from .dav3 import DepthAnything3Model
 

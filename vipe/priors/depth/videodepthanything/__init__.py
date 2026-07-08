@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -55,11 +58,17 @@ class VideoDepthAnythingDepthModel(DepthEstimationModel):
 
         self.input_size = input_size
 
+        local_model_path = os.environ.get("VIPE_VIDEODEPTHANYTHING_MODEL_PATH")
+        if local_model_path:
+            checkpoint_path = Path(local_model_path)
+            if checkpoint_path.is_dir():
+                checkpoint_path = checkpoint_path / f"video_depth_anything_{model}.pth"
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        else:
+            state_dict = torch.hub.load_state_dict_from_url(self.ckpt_url, map_location="cpu")
+
         self.model = VideoDepthAnything(**self.model_config)
-        self.model.load_state_dict(
-            torch.hub.load_state_dict_from_url(self.ckpt_url, map_location="cpu"),
-            strict=True,
-        )
+        self.model.load_state_dict(state_dict, strict=True)
         self.model.cuda().eval()
 
     @property

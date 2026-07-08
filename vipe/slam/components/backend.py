@@ -52,7 +52,8 @@ class SLAMBackend:
             optimize_rig_rotation=self.args.optimize_rig_rotation,
             solver_verbose=True,
         )
-        self.video.update_disps_sens(self.depth_model, frame_idx=None)
+        if not self.video.update_disps_sens_sequence(self.depth_model):
+            self.video.update_disps_sens(self.depth_model, frame_idx=None)
         # Don't update intrinsics again!
         graph.update_batch(
             itrs=16 if more_iters else 8,

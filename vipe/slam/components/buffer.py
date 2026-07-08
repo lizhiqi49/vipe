@@ -124,6 +124,7 @@ class GraphBuffer:
             device=device,
             dtype=torch.float,
         )
+        self.last_sequence_depth_signature: tuple | None = None
 
         # Masks (resolution / 8), 1 = invalid, 0 = valid
         self.masks = torch.zeros(
@@ -265,8 +266,54 @@ class GraphBuffer:
             disp_sens = disp_sens[:, 3::8, 3::8]
             disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
             self.disps_sens[frame_idx] = disp_sens
+            self.last_sequence_depth_signature = None
 
         self.last_depth_intrinsics = intrinsics.clone()
+
+    def _sequence_depth_signature(self, depth_model: DepthEstimationModel, intrinsics: torch.Tensor) -> tuple:
+        return (
+            id(depth_model),
+            self.n_frames,
+            self.height,
+            self.width,
+            tuple(int(value) for value in self.tstamp[: self.n_frames].detach().cpu().tolist()),
+            tuple(float(value) for value in intrinsics.detach().cpu().flatten().tolist()),
+        )
+
+    def update_disps_sens_sequence(self, depth_model: DepthEstimationModel | None) -> bool:
+        if depth_model is None:
+            return False
+
+        estimate_sequence = getattr(depth_model, "estimate_keyframe_sequence", None)
+        if not callable(estimate_sequence):
+            return False
+
+        assert self.n_views == 1
+        intrinsics = unpack_optional(self.intrinsics)
+        signature = self._sequence_depth_signature(depth_model, intrinsics)
+        if self.last_sequence_depth_signature == signature:
+            return True
+
+        video_frame_list = [
+            image.detach().moveaxis(0, -1).float().cpu().numpy() for image in self.images[: self.n_frames, 0]
+        ]
+        depth_input = DepthEstimationInput(
+            video_frame_list=video_frame_list,
+            intrinsics=intrinsics[0],
+            camera_type=self.camera_type,
+        )
+        metric_depth = unpack_optional(estimate_sequence(depth_input).metric_depth)
+        if metric_depth.dim() != 3:
+            raise ValueError("sequence keyframe depth must have shape (N, H, W)")
+        if metric_depth.shape[0] != self.n_frames:
+            raise ValueError("sequence keyframe depth count must match current keyframe count")
+
+        disp_sens = metric_depth[:, 3::8, 3::8]
+        disp_sens = torch.where(disp_sens > 0, disp_sens.reciprocal(), disp_sens)
+        self.disps_sens[: self.n_frames, 0] = disp_sens.to(device=self.disps_sens.device, dtype=self.disps_sens.dtype)
+        self.last_depth_intrinsics = intrinsics.clone()
+        self.last_sequence_depth_signature = signature
+        return True
 
     def build_adaptive_cross_view_idx(self, valid_thresh: float = 400.0):
         """

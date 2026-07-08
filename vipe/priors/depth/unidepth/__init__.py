@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from pathlib import Path
 from typing import Literal
 
 import torch
@@ -24,10 +27,23 @@ from ..base import DepthEstimationInput, DepthEstimationModel, DepthEstimationRe
 from .models.unidepthv2.unidepthv2 import Pinhole, UniDepthV2
 
 
+def _load_unidepth_from_local_path(model_path: Path) -> UniDepthV2:
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"UniDepth local model config not found: {config_path}")
+    with config_path.open() as f:
+        config = json.load(f)
+    return UniDepthV2.from_pretrained(model_path, config=config)
+
+
 class UniDepth2Model(DepthEstimationModel):
     def __init__(self, type: Literal["s", "b", "l"] = "l") -> None:
         super().__init__()
-        self.model = UniDepthV2.from_pretrained(f"lpiccinelli/unidepth-v2-vit{type}14")
+        local_model_path = os.environ.get("VIPE_UNIDEPTH_MODEL_PATH")
+        if local_model_path:
+            self.model = _load_unidepth_from_local_path(Path(local_model_path))
+        else:
+            self.model = UniDepthV2.from_pretrained(f"lpiccinelli/unidepth-v2-vit{type}14")
         self.model.interpolation_mode = "bilinear"
         self.model = self.model.cuda().eval()
 

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 from einops import rearrange
 
@@ -29,7 +31,16 @@ class PriorDAModel(DepthEstimationModel):
 
     def __init__(self) -> None:
         super().__init__()
-        self.model = PriorDepthAnything(device="cuda")
+        local_model_path = os.environ.get("VIPE_PRIORDA_MODEL_PATH")
+        if local_model_path:
+            self.model = PriorDepthAnything(
+                device="cuda",
+                fmde_dir=local_model_path,
+                cmde_dir=local_model_path,
+                ckpt_dir=local_model_path,
+            )
+        else:
+            self.model = PriorDepthAnything(device="cuda")
 
     @property
     def depth_type(self) -> DepthType:
